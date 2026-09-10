@@ -1,0 +1,28 @@
+How to run
+
+Open a normal terminal in the repo folder, then:
+
+1. See the rules
+
+
+powershell -ExecutionPolicy Bypass -File "copilot_helper_tools\approval-auto.ps1" -ShowTargets
+2. Check it sees your buttons — open a real prompt first
+
+
+powershell -ExecutionPolicy Bypass -File "copilot_helper_tools\approval-auto.ps1" -List
+Look for green <-- WOULD CLICK lines.
+3. Dry run — finds but never clicks
+
+
+powershell -ExecutionPolicy Bypass -File "copilot_helper_tools\approval-auto.ps1" -DryRun
+4. Run for real
+
+
+powershell -ExecutionPolicy Bypass -File "copilot_helper_tools\approval-auto.ps1"
+Ctrl+C to stop.
+Useful flags
+
+-IncludeAmbiguous — also bare Run, Accept, Continue.
+-LogFile clicks.log — keep a record of every click.
+-IntervalMs 500 — react faster.
+-MaxClicks 1 — click once, then quit.
