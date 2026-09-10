@@ -20,10 +20,13 @@
   MULTI-SESSION
     Only the active chat session is rendered, so a background session waiting
     for approval has no buttons in the tree at all. When no approve button is
-    found, the script clicks whatever is marked as waiting -
-    "1 pending confirmation", "Needs attention", "2 sessions require input",
-    "Awaiting Permission: ..." - which focuses or scrolls to that session.
-    The approve button then appears on the next scan and gets clicked.
+    found, the script looks in the Sessions list for a row whose status is
+    "(Needs Input)" and clicks it. That session becomes active, its approve
+    button appears on the next scan, and gets clicked.
+
+    Detection is structural, not textual. The chat transcript and every open
+    editor share this same tree, so matching badge wording like "Needs
+    attention" would fire on any document containing that phrase.
 
   EMPTY TREE
     Chromium only builds an accessibility tree once a client pokes the CHILD
@@ -69,11 +72,21 @@ param(
     # Do NOT click waiting sessions to bring their buttons into the tree.
     [switch] $NoFocusSessions,
 
+    # Focus waiting sessions but never press an approve button. Safe way to
+    # prove the session-switching half works before letting it approve anything.
+    [switch] $FocusOnly,
+
     # Extra regex patterns to treat as approve buttons, highest priority.
     [string[]] $ExtraPatterns = @(),
 
     # Extra regex patterns to never click, on top of the built-in deny list.
     [string[]] $ExcludePatterns = @(),
+
+    # Extra regex patterns that mark a session as waiting, e.g.
+    #   -ExtraWaitingPatterns '^\s*.\s*1 pending confirmation$'
+    # Off by default: badge wording is ordinary English and matches document
+    # and chat text that lives in the same accessibility tree.
+    [string[]] $ExtraWaitingPatterns = @(),
 
     # Dump elements found right now, then exit.
     [switch] $List,
@@ -151,12 +164,34 @@ $denyPatterns = @(
 # Elements whose label says a session is blocked on a human. Clicking one
 # focuses that session, or scrolls to the confirmation inside the active one.
 # Strings taken from nls.messages.json.
-$waitingPatterns = @(
-    'pending confirmation'      # "1 pending confirmation", "3 pending confirmations"
-    'requires? input'           # "1 session requires input", "2 sessions require input"
-    'Needs [Aa]ttention'
+# IMPORTANT: loose substring matching does NOT work here. The chat transcript
+# and any open editor are part of the same accessibility tree, so a phrase like
+# "pending confirmation" appearing in a document or a chat reply would be picked
+# up as a real session. Markdown bullets in chat even render as ListItem.
+# Everything below is therefore anchored, short, and structural.
+
+# The sessions list builds each row from this template, found in
+# nls.messages.json:   "{0} session {1} ({2}), created {3}"
+# which renders as:
+#   Local session IoT implementation request (Needs Input), created 9/11/2026, 12:35:58 AM
+#            ^ kind        ^ title                ^ status          ^ timestamp
+$sessionRowPattern = '^\S+\s*session\s+.+\s\(([^()]{1,40})\),\s*created\s'
+
+# Status values inside those parentheses that mean "blocked on a human".
+$waitingStatuses = @(
+    'Needs Input'
+    'Needs Attention'
     'Awaiting Permission'
 )
+
+# Badge strings like "1 pending confirmation", "Needs attention" and
+# "2 sessions require input" are NOT used by default. They are ordinary English
+# and appear verbatim in documentation, in markdown tables, and in chat replies,
+# all of which live in the same accessibility tree. Anchoring the regex does not
+# help: a table cell reading exactly "1 pending confirmation" is an exact match.
+# The session row template above is unambiguous, so that is what we rely on.
+# Pass -ExtraWaitingPatterns to opt back in.
+$waitingBadgePatterns = @() + $ExtraWaitingPatterns
 
 # ================================================================= rules =====
 # Ordered: the earliest match wins when several buttons are on screen.
@@ -356,10 +391,15 @@ $CT    = [System.Windows.Automation.ControlType]
 # Control types that can act as a button inside a VS Code webview.
 $clickableTypes = @($CT::Button, $CT::Hyperlink, $CT::MenuItem, $CT::ListItem, $CT::CheckBox)
 
-# Types that can carry a "waiting" badge. Text and TreeItem included, because
-# the session list rows and the status line are not buttons.
-$waitingTypes = @($CT::Button, $CT::ListItem, $CT::TreeItem, $CT::Text,
-                  $CT::Hyperlink, $CT::MenuItem, $CT::Group)
+# Session rows are ListItem/TreeItem. Text is scanned only when the user opted
+# into badge patterns - there are thousands of Text elements and every line of
+# every open document is one of them.
+$waitingTypes = @($CT::ListItem, $CT::TreeItem, $CT::DataItem)
+if ($ExtraWaitingPatterns.Count -gt 0) { $waitingTypes += $CT::Text }
+
+# Real button and row labels are short. Anything longer is document or chat
+# content that happens to live in the same tree - never a control.
+$MaxLabelLength = 300
 
 # ============================================================== helpers ======
 
@@ -408,9 +448,10 @@ function Get-TargetHandles {
         foreach ($child in [Win32Windows]::Children($h)) {
             if (-not [Win32Windows]::Visible($child)) { continue }
 
+            # "Intermediate D3D Window" is a GPU compositing surface and always
+            # exposes zero elements, so it is not worth attaching to.
             $ccls = [Win32Windows]::ClassOf($child)
-            if ($ccls -notlike "Chrome_RenderWidgetHostHWND*" -and
-                $ccls -notlike "Intermediate D3D Window*") { continue }
+            if ($ccls -notlike "Chrome_RenderWidgetHostHWND*") { continue }
 
             $handles += [pscustomobject]@{
                 Handle = $child; Class = $ccls; Pid = $windowPid; Kind = "render"; Title = $title
@@ -508,6 +549,9 @@ function Get-Rank {
     param([string] $Name)
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    if ($Name.Length -gt $MaxLabelLength) { return $null }   # document / chat text
+    if ($Name -match "[\r\n]") { return $null }
+
     $norm = Get-NormalizedName $Name
 
     foreach ($d in $denyPatterns) {
@@ -522,14 +566,52 @@ function Get-Rank {
 }
 
 # True when a label says this session is blocked waiting for a human.
+# Deliberately strict: the chat transcript and open editors share this tree, so
+# anything unanchored or long is treated as content, not as a control.
 function Test-Waiting {
-    param([string] $Name)
+    param([string] $Name, [string] $Type = "")
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
-    foreach ($w in $waitingPatterns) {
-        if ($Name -match $w) { return $true }
+    if ($Name.Length -gt $MaxLabelLength) { return $false }
+    if ($Name -match "[\r\n]") { return $false }        # multi-line = document text
+
+    # 1. A real sessions-list row. Status must say it is blocked.
+    $m = [regex]::Match($Name, $sessionRowPattern)
+    if ($m.Success) {
+        $status = $m.Groups[1].Value.Trim()
+        foreach ($s in $waitingStatuses) {
+            if ($status -eq $s) { return $true }
+        }
+        return $false
     }
+
+    # 2. A short badge that is the entire label.
+    foreach ($p in $waitingBadgePatterns) {
+        if ($Name -match $p) { return $true }
+    }
+
     return $false
+}
+
+# The waiting text is often a child label inside the real session row.
+# Walk up to the nearest row or button so the click actually selects it.
+function Get-ClickableAncestor {
+    param($Element)
+
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $cur    = $Element
+
+    for ($i = 0; $i -lt 6 -and $cur; $i++) {
+        try {
+            $t = $cur.Current.ControlType
+            if ($t -eq $CT::ListItem -or $t -eq $CT::TreeItem -or
+                $t -eq $CT::DataItem -or $t -eq $CT::Button) { return $cur }
+            $cur = $walker.GetParent($cur)
+        } catch {
+            break
+        }
+    }
+    return $Element
 }
 
 function Invoke-Element {
@@ -551,16 +633,35 @@ function Invoke-Element {
         return "SelectionItemPattern"
     }
 
-    # Fallback 2: real mouse click. Cursor is restored afterwards.
+    # Fallback 2: real mouse click at the point UIA nominates.
+    # Cursor is moved, clicked, then put straight back.
     try {
         $pt = $Element.GetClickablePoint()
         [Win32Windows]::ClickAt([int]$pt.X, [int]$pt.Y)
         return "MouseClick"
     } catch {
-        Write-Verbose "No clickable point: $_"
+        Write-Verbose "GetClickablePoint failed: $_"
     }
 
-    throw "Element '$(Get-ElementName $Element)' supports no clickable pattern."
+    # Fallback 3: centre of the bounding rectangle.
+    # Agent Sessions rows expose ScrollItemPattern and nothing else - no Invoke,
+    # no SelectionItem - and GetClickablePoint() throws on them. Their
+    # BoundingRectangle is valid though, so click its centre.
+    try {
+        $r = $Element.Current.BoundingRectangle
+        if ($r.Width -gt 0 -and $r.Height -gt 0 -and
+            -not [double]::IsInfinity($r.X) -and -not [double]::IsInfinity($r.Y)) {
+
+            $x = [int]($r.X + $r.Width  / 2)
+            $y = [int]($r.Y + $r.Height / 2)
+            [Win32Windows]::ClickAt($x, $y)
+            return "MouseClickRect"
+        }
+    } catch {
+        Write-Verbose "BoundingRectangle unusable: $_"
+    }
+
+    throw "Element '$(Get-ElementName $Element)' has no usable pattern, clickable point or rectangle."
 }
 
 # Scroll an off-screen element into view so its buttons render.
@@ -589,8 +690,15 @@ if ($ShowTargets) {
         Write-Host ("  {0} {1,3}. {2,-48} {3}" -f $t, ($i + 1), $r.Pattern, $r.Note) -ForegroundColor $c
     }
 
-    Write-Host "`nWaiting-session markers (clicked to focus that session):" -ForegroundColor Cyan
-    foreach ($w in $waitingPatterns) { Write-Host "     $w" -ForegroundColor DarkGray }
+    Write-Host "`nWaiting-session detection (clicked to focus that session):" -ForegroundColor Cyan
+    Write-Host "     row template : $sessionRowPattern" -ForegroundColor DarkGray
+    Write-Host ("     blocked when status is: {0}" -f ($waitingStatuses -join ", ")) -ForegroundColor DarkGray
+    if ($waitingBadgePatterns.Count -eq 0) {
+        Write-Host "     badges       : none (use -ExtraWaitingPatterns to add)" -ForegroundColor DarkGray
+    } else {
+        foreach ($w in $waitingBadgePatterns) { Write-Host "     badge        : $w" -ForegroundColor DarkGray }
+    }
+    Write-Host "     labels longer than $MaxLabelLength chars are ignored as document text" -ForegroundColor DarkGray
 
     Write-Host "`nNever clicked (deny list):" -ForegroundColor Cyan
     foreach ($d in $denyPatterns) { Write-Host "     $d" -ForegroundColor DarkGray }
@@ -602,7 +710,7 @@ if ($ShowTargets) {
 
 # =============================================================== attach ======
 
-$handles = Get-TargetHandles
+$handles = @(Get-TargetHandles)
 if ($handles.Count -eq 0) {
     Write-Warning "No VS Code window found. Is it running?"
     exit 1
@@ -610,7 +718,7 @@ if ($handles.Count -eq 0) {
 
 Wake-Accessibility $handles
 Start-Sleep -Milliseconds 1500      # give Chromium time to build the tree
-$roots = Get-Roots $handles
+$roots = @(Get-Roots $handles)
 
 # ============================================================= diagnose ======
 
@@ -640,9 +748,12 @@ if ($Diag) {
     foreach ($r in $roots) {
         foreach ($e in (Get-Elements $r $waitingTypes)) {
             $n = Get-ElementName $e
-            if (Test-Waiting $n) {
+            $t = Get-ElementType $e
+            if (Test-Waiting $n $t) {
                 $waits++
-                Write-Host ("  {0,-12} {1}" -f (Get-ElementType $e), $n) -ForegroundColor Yellow
+                $anc = Get-ClickableAncestor $e
+                $via = if ($anc -ne $e) { " -> clicks $(Get-ElementType $anc) '$(Get-ElementName $anc)'" } else { "" }
+                Write-Host ("  {0,-12} {1}{2}" -f $t, $n, $via) -ForegroundColor Yellow
             }
         }
     }
@@ -668,7 +779,8 @@ if ($List) {
     $hits  = 0
     $waits = 0
 
-    $types = if ($AllTypes) { $null } else { $clickableTypes + $waitingTypes }
+    # Both sets overlap, so dedupe before building the OrCondition.
+    $types = if ($AllTypes) { $null } else { @(($clickableTypes + $waitingTypes) | Select-Object -Unique) }
 
     foreach ($r in $roots) {
         foreach ($e in (Get-Elements $r $types $AllTypes.IsPresent)) {
@@ -687,6 +799,11 @@ if ($List) {
 
             $norm  = Get-NormalizedName $name
             $shown = if ($norm -ne $name -and $norm) { "$name   -> '$norm'" } else { $name }
+
+            # Editor and chat content lives in this tree too. Keep the console readable.
+            $shown = ($shown -replace "\s+", " ")
+            if ($shown.Length -gt 160) { $shown = $shown.Substring(0, 157) + "..." }
+
             $rank  = Get-Rank $name
 
             if ($null -ne $rank) {
@@ -694,7 +811,7 @@ if ($List) {
                 Write-Host ("  [{0}] {1,-12} {2}  <-- WOULD CLICK (rule {3}: {4})" -f
                     $tag, $type, $shown, ($rank + 1), $rules[$rank].Pattern) -ForegroundColor Green
             }
-            elseif (Test-Waiting $name) {
+            elseif (Test-Waiting $name $type) {
                 $waits++
                 Write-Host ("  [{0}] {1,-12} {2}  <-- WAITING SESSION, would focus" -f
                     $tag, $type, $shown) -ForegroundColor Yellow
@@ -720,9 +837,9 @@ $activeCount  = @($rules | Where-Object { $_.Tier -eq 'safe' -or $IncludeAmbiguo
 $windowCount  = @($handles | Where-Object { $_.Kind -eq "window" }).Count
 
 Write-Host ("Watching {0} rules across {1} VS Code window(s)." -f $activeCount, $windowCount) -ForegroundColor Cyan
-Write-Host ("Ambiguous: {0}   Offscreen: {1}   FocusSessions: {2}   DryRun: {3}" -f
+Write-Host ("Ambiguous: {0}   Offscreen: {1}   FocusSessions: {2}   DryRun: {3}   FocusOnly: {4}" -f
     $IncludeAmbiguous.IsPresent, $IncludeOffscreen.IsPresent,
-    (-not $NoFocusSessions.IsPresent), $DryRun.IsPresent) -ForegroundColor DarkGray
+    (-not $NoFocusSessions.IsPresent), $DryRun.IsPresent, $FocusOnly.IsPresent) -ForegroundColor DarkGray
 Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
 
 $clicks      = 0
@@ -735,7 +852,7 @@ while ($true) {
     # Pick up windows opened or closed since last time.
     $sinceRescan = ([DateTime]::UtcNow - $lastRescan).TotalMilliseconds
     if ($roots.Count -eq 0 -or $sinceRescan -ge $RescanWindowsMs) {
-        $newHandles = Get-TargetHandles
+        $newHandles = @(Get-TargetHandles)
         $lastRescan = [DateTime]::UtcNow
 
         if ($newHandles.Count -eq 0) {
@@ -748,7 +865,7 @@ while ($true) {
             $handles = $newHandles
             Wake-Accessibility $handles
             Start-Sleep -Milliseconds 800
-            $roots = Get-Roots $handles
+            $roots = @(Get-Roots $handles)
             $wc = @($handles | Where-Object { $_.Kind -eq "window" }).Count
             Write-Host ("Re-attached: {0} window(s)." -f $wc) -ForegroundColor DarkGray
         }
@@ -777,9 +894,10 @@ while ($true) {
             ([DateTime]::UtcNow - $lastClick[$bestName]).TotalMilliseconds
         } else { [double]::MaxValue }
 
-        if ($DryRun) {
-            Write-Host ("{0}  FOUND '{1}' (rule {2}, dry run)" -f
-                (Get-Date -Format "HH:mm:ss"), $bestName, ($bestRank + 1)) -ForegroundColor Yellow
+        if ($DryRun -or $FocusOnly) {
+            $why = if ($FocusOnly) { "focus only" } else { "dry run" }
+            Write-Host ("{0}  FOUND '{1}' (rule {2}, {3}, not clicked)" -f
+                (Get-Date -Format "HH:mm:ss"), $bestName, ($bestRank + 1), $why) -ForegroundColor Yellow
         }
         elseif ($since -ge $CooldownMs) {
             try {
@@ -813,8 +931,11 @@ while ($true) {
             $done = $false
             foreach ($e in (Get-Elements $r $waitingTypes)) {
                 $name = Get-ElementName $e
-                if (-not (Test-Waiting $name)) { continue }
-                if (-not (Test-Clickable $e $true)) { continue }
+                if (-not (Test-Waiting $name (Get-ElementType $e))) { continue }
+
+                # The "?" label is usually a child of the real session row.
+                $target = Get-ClickableAncestor $e
+                if (-not (Test-Clickable $target $true)) { continue }
 
                 $since = if ($lastFocus.ContainsKey($name)) {
                     ([DateTime]::UtcNow - $lastFocus[$name]).TotalMilliseconds
@@ -830,16 +951,16 @@ while ($true) {
                 }
 
                 try {
-                    [void](Show-Element $e)
-                    $how = Invoke-Element $e
+                    [void](Show-Element $target)
+                    $how = Invoke-Element $target
                     $lastFocus[$name] = [DateTime]::UtcNow
                     Write-Host ("{0}  FOCUSED '{1}' via {2}" -f
                         (Get-Date -Format "HH:mm:ss"), $name, $how) -ForegroundColor Magenta
-                    Start-Sleep -Milliseconds 700   # let the session render
+                    Start-Sleep -Milliseconds 900   # let the session render
                     $done = $true
                     break
                 } catch {
-                    Write-Verbose "Could not focus '$name': $_"
+                    Write-Warning "Could not focus '$name': $($_.Exception.Message)"
                     $lastFocus[$name] = [DateTime]::UtcNow
                 }
             }
