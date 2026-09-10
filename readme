@@ -14,9 +14,9 @@ Every second it scans VS Code's accessibility tree and:
 
 1. Clicks any approval button it finds — `Allow`, `Allow in this Session`,
    `Always Allow`, `Run Command`, `Keep All Edits`, and about 40 more.
-2. If no button is on screen, it clicks a **waiting marker**
-   (`1 pending confirmation`, `Needs attention`, `2 sessions require input`)
-   to bring that session forward — then clicks its button on the next pass.
+2. If no button is on screen, it looks in the **Sessions list** for a row whose
+   status is `(Needs Input)`, clicks it to bring that session forward — then
+   clicks its button on the next pass.
 
 It never clicks the deny side: `Skip`, `Skip All`, `Cancel`, `Discard`, `Undo`,
 `Don't Allow`, `Proceed without executing`.
