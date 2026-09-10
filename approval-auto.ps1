@@ -1,30 +1,42 @@
 <#
 .SYNOPSIS
-  Auto-clicks VS Code approval buttons using Windows UI Automation.
+  Auto-clicks VS Code approval buttons across every window and chat session.
 
 .DESCRIPTION
   No install needed. Uses the UIAutomationClient assemblies shipped with Windows.
   Run with Windows PowerShell 5.1 (powershell.exe).
 
-  The approval labels below were extracted from this machine's own VS Code
-  string table:
+  Labels were extracted from this machine's own VS Code string table:
     resources\app\out\nls.messages.json
   Many are templates, e.g. "Allow {0} in this Session" renders as
-  "Allow python in this Session". So matching uses regex rules, not fixed names.
+  "Allow python in this Session", so matching uses regex, not fixed names.
+  VS Code also appends keybinding hints, e.g. "Allow (Ctrl+Enter)". Stripped.
 
-  VS Code also appends keybinding hints, e.g. "Allow (Ctrl+Enter)".
-  Those are stripped before matching.
+  MULTI-WINDOW
+    Electron owns every window from one process, so Process.MainWindowHandle
+    returns only ONE window. This script uses EnumWindows instead, so it sees
+    every VS Code window plus the Agent Sessions window.
 
-  Why the tree can look empty:
-    VS Code is Electron/Chromium. The renderer only builds an accessibility
-    tree once a client pokes the CHILD window (Chrome_RenderWidgetHostHWND)
-    with WM_GETOBJECT. Attaching to only the top window returns just
-    Minimize/Restore/Close. This script pokes the child windows too.
-    Last resort: relaunch with  code --force-renderer-accessibility
+  MULTI-SESSION
+    Only the active chat session is rendered, so a background session waiting
+    for approval has no buttons in the tree at all. When no approve button is
+    found, the script clicks whatever is marked as waiting -
+    "1 pending confirmation", "Needs attention", "2 sessions require input",
+    "Awaiting Permission: ..." - which focuses or scrolls to that session.
+    The approve button then appears on the next scan and gets clicked.
+
+  EMPTY TREE
+    Chromium only builds an accessibility tree once a client pokes the CHILD
+    window (Chrome_RenderWidgetHostHWND) with WM_GETOBJECT. This script does
+    that. Last resort: relaunch with  code --force-renderer-accessibility
 
   WARNING: these buttons are the human approval step for running terminal
   commands, fetching URLs and writing files. Automating them means nothing
-  gets reviewed before it happens.
+  gets reviewed before it happens - now across every window at once.
+
+.EXAMPLE
+  # Show every window and session the script can see
+  powershell -ExecutionPolicy Bypass -File .\approval-auto.ps1 -Diag
 
 .EXAMPLE
   # Show every rule and its click priority
@@ -39,12 +51,8 @@
   powershell -ExecutionPolicy Bypass -File .\approval-auto.ps1 -DryRun
 
 .EXAMPLE
-  # Run for real
-  powershell -ExecutionPolicy Bypass -File .\approval-auto.ps1
-
-.EXAMPLE
-  # Also click bare "Run" / "Accept" / "Continue" / "Keep Going"
-  powershell -ExecutionPolicy Bypass -File .\approval-auto.ps1 -IncludeAmbiguous
+  # Run for real, including buttons scrolled out of view
+  powershell -ExecutionPolicy Bypass -File .\approval-auto.ps1 -IncludeOffscreen
 #>
 
 [CmdletBinding()]
@@ -53,6 +61,13 @@ param(
     # Off by default because the debug toolbar, test explorer and merge editor
     # use those exact same labels, and they are on screen all the time.
     [switch] $IncludeAmbiguous,
+
+    # Also click approve buttons that are scrolled out of view.
+    # Useful when a long chat has pushed the confirmation off screen.
+    [switch] $IncludeOffscreen,
+
+    # Do NOT click waiting sessions to bring their buttons into the tree.
+    [switch] $NoFocusSessions,
 
     # Extra regex patterns to treat as approve buttons, highest priority.
     [string[]] $ExtraPatterns = @(),
@@ -66,7 +81,7 @@ param(
     # With -List: show every control type, not just clickable ones.
     [switch] $AllTypes,
 
-    # Print processes, child windows and element counts, then exit.
+    # Print windows, sessions and element counts, then exit.
     [switch] $Diag,
 
     # Print the rule list with priority order, then exit.
@@ -80,6 +95,12 @@ param(
 
     # Do not click the same label again within this many milliseconds.
     [int] $CooldownMs = 2500,
+
+    # Do not re-focus the same waiting session within this many milliseconds.
+    [int] $SessionCooldownMs = 6000,
+
+    # Rescan for new/closed VS Code windows every this many milliseconds.
+    [int] $RescanWindowsMs = 15000,
 
     # Stop after this many clicks. 0 = run forever.
     [int] $MaxClicks = 0,
@@ -112,6 +133,7 @@ $denyPatterns = @(
     '^Delete'
     '^Remove'
     '^Stop'
+    '^Archive'
     '^Proceed without executing'
     '^Continue Without Signing In'
     '^Continue in Background'
@@ -125,21 +147,27 @@ $denyPatterns = @(
     '^Allow requests to\.\.\.$'   # opens a picker, does not approve
 ) + $ExcludePatterns
 
+# ====================================================== waiting-session marks =
+# Elements whose label says a session is blocked on a human. Clicking one
+# focuses that session, or scrolls to the confirmation inside the active one.
+# Strings taken from nls.messages.json.
+$waitingPatterns = @(
+    'pending confirmation'      # "1 pending confirmation", "3 pending confirmations"
+    'requires? input'           # "1 session requires input", "2 sessions require input"
+    'Needs [Aa]ttention'
+    'Awaiting Permission'
+)
+
 # ================================================================= rules =====
 # Ordered: the earliest match wins when several buttons are on screen.
 # Least privilege first - a one-off Allow beats a permanent Always Allow.
-# Tier 'safe'      -> always active.
-# Tier 'ambiguous' -> only with -IncludeAmbiguous.
 function New-Rule {
     param([string] $Pattern, [string] $Tier, [string] $Note)
     [pscustomobject]@{ Pattern = $Pattern; Tier = $Tier; Note = $Note }
 }
 
 $rules = @()
-
-foreach ($p in $ExtraPatterns) {
-    $rules += New-Rule $p 'safe' 'user supplied'
-}
+foreach ($p in $ExtraPatterns) { $rules += New-Rule $p 'safe' 'user supplied' }
 
 $rules += @(
     # --- one-off approvals, narrowest possible scope
@@ -223,13 +251,22 @@ public static class Win32Windows
     private delegate bool EnumWindowProc(IntPtr hWnd, IntPtr lParam);
 
     [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowProc cb, IntPtr lParam);
+
+    [DllImport("user32.dll")]
     private static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowProc cb, IntPtr lParam);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetClassName(IntPtr hWnd, StringBuilder name, int maxCount);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
 
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessageTimeout(
@@ -258,7 +295,30 @@ public static class Win32Windows
         return sb.ToString();
     }
 
+    public static string TitleOf(IntPtr hWnd)
+    {
+        var sb = new StringBuilder(512);
+        GetWindowText(hWnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    public static uint PidOf(IntPtr hWnd)
+    {
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        return pid;
+    }
+
     public static bool Visible(IntPtr hWnd) { return IsWindowVisible(hWnd); }
+
+    // Every top-level window on the desktop. Electron owns all of its windows
+    // from one process, so Process.MainWindowHandle only ever returns one.
+    public static List<IntPtr> TopLevel()
+    {
+        var found = new List<IntPtr>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) { found.Add(h); return true; }, IntPtr.Zero);
+        return found;
+    }
 
     public static List<IntPtr> Children(IntPtr parent)
     {
@@ -296,6 +356,11 @@ $CT    = [System.Windows.Automation.ControlType]
 # Control types that can act as a button inside a VS Code webview.
 $clickableTypes = @($CT::Button, $CT::Hyperlink, $CT::MenuItem, $CT::ListItem, $CT::CheckBox)
 
+# Types that can carry a "waiting" badge. Text and TreeItem included, because
+# the session list rows and the status line are not buttons.
+$waitingTypes = @($CT::Button, $CT::ListItem, $CT::TreeItem, $CT::Text,
+                  $CT::Hyperlink, $CT::MenuItem, $CT::Group)
+
 # ============================================================== helpers ======
 
 function Write-Log {
@@ -307,34 +372,48 @@ function Write-Log {
     }
 }
 
-function Get-EditorProcesses {
-    $procs = @()
+function Get-EditorPids {
+    $pids = @{}
     foreach ($n in $ProcessNames) {
-        $procs += @(Get-Process -Name $n -ErrorAction SilentlyContinue |
-                    Where-Object { $_.MainWindowHandle -ne 0 })
+        foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+            $pids[[uint32]$p.Id] = $n
+        }
     }
-    return $procs
+    return $pids
 }
 
+# Every VS Code window, main and Agent Sessions, plus their render widgets.
 function Get-TargetHandles {
+    $pids    = Get-EditorPids
     $handles = @()
 
-    foreach ($p in (Get-EditorProcesses)) {
-        $main = $p.MainWindowHandle
+    if ($pids.Count -eq 0) { return $handles }
+
+    foreach ($h in [Win32Windows]::TopLevel()) {
+        if (-not [Win32Windows]::Visible($h)) { continue }
+
+        $windowPid = [Win32Windows]::PidOf($h)
+        if (-not $pids.ContainsKey($windowPid)) { continue }
+
+        $cls = [Win32Windows]::ClassOf($h)
+        if ($cls -notlike "Chrome_WidgetWin*") { continue }
+
+        $title = [Win32Windows]::TitleOf($h)
+        if ([string]::IsNullOrWhiteSpace($title)) { continue }   # hidden helper windows
+
         $handles += [pscustomobject]@{
-            Handle = $main; Class = [Win32Windows]::ClassOf($main); Pid = $p.Id; Kind = "main"
+            Handle = $h; Class = $cls; Pid = $windowPid; Kind = "window"; Title = $title
         }
 
-        foreach ($child in [Win32Windows]::Children($main)) {
+        foreach ($child in [Win32Windows]::Children($h)) {
             if (-not [Win32Windows]::Visible($child)) { continue }
 
-            $cls = [Win32Windows]::ClassOf($child)
-            if ($cls -notlike "Chrome_RenderWidgetHostHWND*" -and
-                $cls -notlike "Intermediate D3D Window*" -and
-                $cls -notlike "Chrome_WidgetWin*") { continue }
+            $ccls = [Win32Windows]::ClassOf($child)
+            if ($ccls -notlike "Chrome_RenderWidgetHostHWND*" -and
+                $ccls -notlike "Intermediate D3D Window*") { continue }
 
             $handles += [pscustomobject]@{
-                Handle = $child; Class = $cls; Pid = $p.Id; Kind = "child"
+                Handle = $child; Class = $ccls; Pid = $windowPid; Kind = "render"; Title = $title
             }
         }
     }
@@ -364,7 +443,7 @@ function Get-Roots {
 }
 
 function Get-Elements {
-    param($Root, [bool] $EveryType)
+    param($Root, $Types, [bool] $EveryType = $false)
 
     try {
         if ($EveryType) {
@@ -372,7 +451,7 @@ function Get-Elements {
         }
 
         $conds = @()
-        foreach ($t in $clickableTypes) {
+        foreach ($t in $Types) {
             $conds += New-Object System.Windows.Automation.PropertyCondition(
                 $AE::ControlTypeProperty, $t)
         }
@@ -413,11 +492,11 @@ function Get-NormalizedName {
 }
 
 function Test-Clickable {
-    param($Element)
+    param($Element, [bool] $AllowOffscreen = $false)
 
     try {
-        if ($Element.Current.IsOffscreen) { return $false }
         if (-not $Element.Current.IsEnabled) { return $false }
+        if ($Element.Current.IsOffscreen -and -not $AllowOffscreen) { return $false }
     } catch {
         return $false
     }
@@ -442,10 +521,21 @@ function Get-Rank {
     return $null
 }
 
+# True when a label says this session is blocked waiting for a human.
+function Test-Waiting {
+    param([string] $Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    foreach ($w in $waitingPatterns) {
+        if ($Name -match $w) { return $true }
+    }
+    return $false
+}
+
 function Invoke-Element {
     param($Element)
 
-    # Preferred: InvokePattern. No mouse movement.
+    # Preferred: InvokePattern. No mouse movement, and works off screen.
     $pattern = $null
     if ($Element.TryGetCurrentPattern(
             [System.Windows.Automation.InvokePattern]::Pattern, [ref] $pattern)) {
@@ -453,7 +543,7 @@ function Invoke-Element {
         return "InvokePattern"
     }
 
-    # Fallback 1: SelectionItem (toolbar-style buttons).
+    # Fallback 1: SelectionItem. Session list rows use this to become active.
     $select = $null
     if ($Element.TryGetCurrentPattern(
             [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref] $select)) {
@@ -473,6 +563,18 @@ function Invoke-Element {
     throw "Element '$(Get-ElementName $Element)' supports no clickable pattern."
 }
 
+# Scroll an off-screen element into view so its buttons render.
+function Show-Element {
+    param($Element)
+
+    $sc = $null
+    if ($Element.TryGetCurrentPattern(
+            [System.Windows.Automation.ScrollItemPattern]::Pattern, [ref] $sc)) {
+        try { $sc.ScrollIntoView(); return $true } catch { }
+    }
+    return $false
+}
+
 # ============================================================== targets ======
 
 if ($ShowTargets) {
@@ -486,6 +588,9 @@ if ($ShowTargets) {
         $t  = if ($on) { "  " } else { "off" }
         Write-Host ("  {0} {1,3}. {2,-48} {3}" -f $t, ($i + 1), $r.Pattern, $r.Note) -ForegroundColor $c
     }
+
+    Write-Host "`nWaiting-session markers (clicked to focus that session):" -ForegroundColor Cyan
+    foreach ($w in $waitingPatterns) { Write-Host "     $w" -ForegroundColor DarkGray }
 
     Write-Host "`nNever clicked (deny list):" -ForegroundColor Cyan
     foreach ($d in $denyPatterns) { Write-Host "     $d" -ForegroundColor DarkGray }
@@ -512,18 +617,36 @@ $roots = Get-Roots $handles
 if ($Diag) {
     Write-Host "Windows attached:" -ForegroundColor Cyan
     foreach ($h in $handles) {
-        Write-Host ("  pid {0,-7} {1,-6} 0x{2:X8}  {3}" -f $h.Pid, $h.Kind, [int64]$h.Handle, $h.Class)
+        Write-Host ("  pid {0,-7} {1,-7} 0x{2:X8}  {3,-32} {4}" -f
+            $h.Pid, $h.Kind, [int64]$h.Handle, $h.Class, $h.Title)
     }
+
+    $windowCount = @($handles | Where-Object { $_.Kind -eq "window" }).Count
+    Write-Host ("`n{0} VS Code window(s), {1} handle(s) total." -f
+        $windowCount, $handles.Count) -ForegroundColor Cyan
 
     Write-Host "`nElement counts per root:" -ForegroundColor Cyan
     $total = 0
     for ($i = 0; $i -lt $roots.Count; $i++) {
-        $all  = (Get-Elements $roots[$i] $true).Count
-        $clik = (Get-Elements $roots[$i] $false).Count
+        $all  = (Get-Elements $roots[$i] $null $true).Count
+        $clik = (Get-Elements $roots[$i] $clickableTypes).Count
         $total += $all
         Write-Host ("  root {0}: {1,5} elements, {2,4} clickable  [{3}]" -f
             $i, $all, $clik, $handles[$i].Class)
     }
+
+    Write-Host "`nSessions currently waiting:" -ForegroundColor Cyan
+    $waits = 0
+    foreach ($r in $roots) {
+        foreach ($e in (Get-Elements $r $waitingTypes)) {
+            $n = Get-ElementName $e
+            if (Test-Waiting $n) {
+                $waits++
+                Write-Host ("  {0,-12} {1}" -f (Get-ElementType $e), $n) -ForegroundColor Yellow
+            }
+        }
+    }
+    if ($waits -eq 0) { Write-Host "  none right now" -ForegroundColor DarkGray }
 
     Write-Host ""
     if ($total -le 10) {
@@ -531,7 +654,7 @@ if ($Diag) {
         Write-Warning "Fix: close ALL VS Code windows, then relaunch with:"
         Write-Warning "     code --force-renderer-accessibility"
     } else {
-        Write-Host "Tree looks alive. Run -List with a prompt open." -ForegroundColor Green
+        Write-Host "Tree looks alive." -ForegroundColor Green
     }
     exit 0
 }
@@ -543,9 +666,12 @@ if ($List) {
     $seen  = @{}
     $count = 0
     $hits  = 0
+    $waits = 0
+
+    $types = if ($AllTypes) { $null } else { $clickableTypes + $waitingTypes }
 
     foreach ($r in $roots) {
-        foreach ($e in (Get-Elements $r $AllTypes.IsPresent)) {
+        foreach ($e in (Get-Elements $r $types $AllTypes.IsPresent)) {
             $name = Get-ElementName $e
             if ([string]::IsNullOrWhiteSpace($name)) { continue }
 
@@ -567,13 +693,20 @@ if ($List) {
                 $hits++
                 Write-Host ("  [{0}] {1,-12} {2}  <-- WOULD CLICK (rule {3}: {4})" -f
                     $tag, $type, $shown, ($rank + 1), $rules[$rank].Pattern) -ForegroundColor Green
-            } else {
+            }
+            elseif (Test-Waiting $name) {
+                $waits++
+                Write-Host ("  [{0}] {1,-12} {2}  <-- WAITING SESSION, would focus" -f
+                    $tag, $type, $shown) -ForegroundColor Yellow
+            }
+            else {
                 Write-Host ("  [{0}] {1,-12} {2}" -f $tag, $type, $shown)
             }
         }
     }
 
-    Write-Host ("`n{0} elements, {1} would be clicked." -f $count, $hits) -ForegroundColor Cyan
+    Write-Host ("`n{0} elements, {1} would be clicked, {2} waiting session(s)." -f
+        $count, $hits, $waits) -ForegroundColor Cyan
     if ($count -le 5) {
         Write-Warning "Almost nothing found. Run -Diag, or relaunch VS Code with:"
         Write-Warning "     code --force-renderer-accessibility"
@@ -583,39 +716,55 @@ if ($List) {
 
 # ============================================================== clicker ======
 
-$activeCount = @($rules | Where-Object { $_.Tier -eq 'safe' -or $IncludeAmbiguous }).Count
-Write-Host ("Watching {0} rules across {1} window(s). Ambiguous: {2}. DryRun: {3}." -f
-    $activeCount, $roots.Count, $IncludeAmbiguous.IsPresent, $DryRun.IsPresent) -ForegroundColor Cyan
+$activeCount  = @($rules | Where-Object { $_.Tier -eq 'safe' -or $IncludeAmbiguous }).Count
+$windowCount  = @($handles | Where-Object { $_.Kind -eq "window" }).Count
+
+Write-Host ("Watching {0} rules across {1} VS Code window(s)." -f $activeCount, $windowCount) -ForegroundColor Cyan
+Write-Host ("Ambiguous: {0}   Offscreen: {1}   FocusSessions: {2}   DryRun: {3}" -f
+    $IncludeAmbiguous.IsPresent, $IncludeOffscreen.IsPresent,
+    (-not $NoFocusSessions.IsPresent), $DryRun.IsPresent) -ForegroundColor DarkGray
 Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
 
-$clicks    = 0
-$lastClick = @{}   # label -> UTC time of last click
+$clicks      = 0
+$lastClick   = @{}                       # label -> UTC time of last click
+$lastFocus   = @{}                       # waiting label -> UTC time of last focus
+$lastRescan  = [DateTime]::UtcNow
 
 while ($true) {
 
-    if ($roots.Count -eq 0) {
-        $handles = Get-TargetHandles
-        if ($handles.Count -eq 0) {
+    # Pick up windows opened or closed since last time.
+    $sinceRescan = ([DateTime]::UtcNow - $lastRescan).TotalMilliseconds
+    if ($roots.Count -eq 0 -or $sinceRescan -ge $RescanWindowsMs) {
+        $newHandles = Get-TargetHandles
+        $lastRescan = [DateTime]::UtcNow
+
+        if ($newHandles.Count -eq 0) {
+            $roots = @()
             Start-Sleep -Milliseconds $IntervalMs
             continue
         }
-        Wake-Accessibility $handles
-        Start-Sleep -Milliseconds 1000
-        $roots = Get-Roots $handles
-        Write-Host "Re-attached ($($roots.Count) windows)." -ForegroundColor DarkGray
+
+        if ($newHandles.Count -ne $handles.Count -or $roots.Count -eq 0) {
+            $handles = $newHandles
+            Wake-Accessibility $handles
+            Start-Sleep -Milliseconds 800
+            $roots = Get-Roots $handles
+            $wc = @($handles | Where-Object { $_.Kind -eq "window" }).Count
+            Write-Host ("Re-attached: {0} window(s)." -f $wc) -ForegroundColor DarkGray
+        }
     }
 
-    # Scan once, keep the highest-priority clickable target.
+    # --- pass 1: any approve button anywhere, highest priority wins ----------
     $best     = $null
     $bestRank = [int]::MaxValue
     $bestName = ""
 
     foreach ($r in $roots) {
-        foreach ($e in (Get-Elements $r $false)) {
+        foreach ($e in (Get-Elements $r $clickableTypes)) {
             $name = Get-ElementName $e
             $rank = Get-Rank $name
             if ($null -eq $rank -or $rank -ge $bestRank) { continue }
-            if (-not (Test-Clickable $e)) { continue }
+            if (-not (Test-Clickable $e $IncludeOffscreen.IsPresent)) { continue }
 
             $best     = $e
             $bestRank = $rank
@@ -626,9 +775,7 @@ while ($true) {
     if ($best) {
         $since = if ($lastClick.ContainsKey($bestName)) {
             ([DateTime]::UtcNow - $lastClick[$bestName]).TotalMilliseconds
-        } else {
-            [double]::MaxValue
-        }
+        } else { [double]::MaxValue }
 
         if ($DryRun) {
             Write-Host ("{0}  FOUND '{1}' (rule {2}, dry run)" -f
@@ -636,6 +783,7 @@ while ($true) {
         }
         elseif ($since -ge $CooldownMs) {
             try {
+                if ($IncludeOffscreen) { [void](Show-Element $best) }
                 $how = Invoke-Element $best
                 $lastClick[$bestName] = [DateTime]::UtcNow
                 $clicks++
@@ -651,9 +799,53 @@ while ($true) {
                 $lastClick[$bestName] = [DateTime]::UtcNow
             }
         }
+
+        Start-Sleep -Milliseconds $IntervalMs
+        continue
     }
 
-    if ((Get-EditorProcesses).Count -eq 0) { $roots = @() }
+    # --- pass 2: no button on screen, so surface a waiting session ----------
+    # A background session's buttons are not in the tree at all. Clicking its
+    # "Needs attention" / "1 pending confirmation" marker focuses it, and the
+    # button shows up on the next scan.
+    if (-not $NoFocusSessions) {
+        foreach ($r in $roots) {
+            $done = $false
+            foreach ($e in (Get-Elements $r $waitingTypes)) {
+                $name = Get-ElementName $e
+                if (-not (Test-Waiting $name)) { continue }
+                if (-not (Test-Clickable $e $true)) { continue }
+
+                $since = if ($lastFocus.ContainsKey($name)) {
+                    ([DateTime]::UtcNow - $lastFocus[$name]).TotalMilliseconds
+                } else { [double]::MaxValue }
+                if ($since -lt $SessionCooldownMs) { continue }
+
+                if ($DryRun) {
+                    Write-Host ("{0}  WAITING '{1}' (would focus, dry run)" -f
+                        (Get-Date -Format "HH:mm:ss"), $name) -ForegroundColor Yellow
+                    $lastFocus[$name] = [DateTime]::UtcNow
+                    $done = $true
+                    break
+                }
+
+                try {
+                    [void](Show-Element $e)
+                    $how = Invoke-Element $e
+                    $lastFocus[$name] = [DateTime]::UtcNow
+                    Write-Host ("{0}  FOCUSED '{1}' via {2}" -f
+                        (Get-Date -Format "HH:mm:ss"), $name, $how) -ForegroundColor Magenta
+                    Start-Sleep -Milliseconds 700   # let the session render
+                    $done = $true
+                    break
+                } catch {
+                    Write-Verbose "Could not focus '$name': $_"
+                    $lastFocus[$name] = [DateTime]::UtcNow
+                }
+            }
+            if ($done) { break }
+        }
+    }
 
     Start-Sleep -Milliseconds $IntervalMs
 }
