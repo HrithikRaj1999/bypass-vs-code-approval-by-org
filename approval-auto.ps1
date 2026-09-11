@@ -76,6 +76,23 @@ param(
     # prove the session-switching half works before letting it approve anything.
     [switch] $FocusOnly,
 
+    # Show a small always-on-top window with a live count and an "Allow All"
+    # button. Lets you clear every waiting terminal and chat from wherever you
+    # are, without hunting through the sessions list.
+    [switch] $Hud,
+
+    # Run silently as a daemon: hides its own console window, logs to a file
+    # instead of the screen, and refuses to start twice. Approves whatever
+    # appears, whichever chat you happen to be looking at.
+    [switch] $Background,
+
+    # Never drive the real mouse. Opening a session normally needs a click,
+    # which moves the pointer and can pull focus. With this, the click is
+    # posted straight to the window instead, so the pointer never moves and
+    # the window is not activated. If a posted click does not land, the tool
+    # falls back to a real one automatically rather than getting stuck.
+    [switch] $NoCursor,
+
     # Extra regex patterns to treat as approve buttons, highest priority.
     [string[]] $ExtraPatterns = @(),
 
@@ -114,6 +131,12 @@ param(
 
     # Rescan for new/closed VS Code windows every this many milliseconds.
     [int] $RescanWindowsMs = 15000,
+
+    # How often to sweep for background approvals even when the screen looks
+    # idle. Sitting inside a chat hides the sessions list, so nothing is found
+    # and the tool would otherwise never look again. The sweep opens the list,
+    # clears everything, and leaves it open - so later scans are free.
+    [int] $SweepMs = 12000,
 
     # Stop after this many clicks. 0 = run forever.
     [int] $MaxClicks = 0,
@@ -370,6 +393,58 @@ public static class Win32Windows
         SendMessageTimeout(hWnd, 0x003D, IntPtr.Zero, unchecked((IntPtr)(-4)), 0x0002, 500, out result);
     }
 
+    [DllImport("user32.dll")]
+    private static extern bool ScreenToClient(IntPtr hWnd, ref POINT p);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT p);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    private const uint WM_MOUSEMOVE   = 0x0200;
+    private const uint WM_LBUTTONDOWN = 0x0201;
+    private const uint WM_LBUTTONUP   = 0x0202;
+    private const int  MK_LBUTTON     = 0x0001;
+
+    public static IntPtr WindowAt(int x, int y)
+    {
+        POINT p; p.X = x; p.Y = y;
+        return WindowFromPoint(p);
+    }
+
+    // Post a click straight to the window at that point instead of driving the
+    // real cursor. The pointer never moves and the window is not activated,
+    // because activation comes from WM_MOUSEACTIVATE on real input, which
+    // posted messages skip entirely.
+    public static bool PostClick(int screenX, int screenY)
+    {
+        POINT p; p.X = screenX; p.Y = screenY;
+        IntPtr h = WindowFromPoint(p);
+        if (h == IntPtr.Zero) { return false; }
+
+        ScreenToClient(h, ref p);
+        IntPtr lp = (IntPtr)(((p.Y & 0xFFFF) << 16) | (p.X & 0xFFFF));
+
+        PostMessage(h, WM_MOUSEMOVE,   IntPtr.Zero,        lp);
+        PostMessage(h, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, lp);
+        PostMessage(h, WM_LBUTTONUP,   IntPtr.Zero,        lp);
+        return true;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int cmd);
+
+    // Hide this process's own console so the daemon leaves nothing on screen.
+    public static void HideConsole()
+    {
+        IntPtr h = GetConsoleWindow();
+        if (h != IntPtr.Zero) { ShowWindow(h, 0); }   // SW_HIDE
+    }
+
     // Last-resort click. Moves the cursor, clicks, then puts the cursor back.
     public static void ClickAt(int x, int y)
     {
@@ -400,6 +475,34 @@ if ($ExtraWaitingPatterns.Count -gt 0) { $waitingTypes += $CT::Text }
 # Real button and row labels are short. Anything longer is document or chat
 # content that happens to live in the same tree - never a control.
 $MaxLabelLength = 300
+
+# =========================================================== background ======
+# Held for the life of the process. Two daemons clicking the same buttons would
+# double-approve, so the second one exits instead of starting.
+$script:singleton = $null
+
+if ($Background) {
+    $created = $false
+    $script:singleton = New-Object System.Threading.Mutex($true, "Local\approval-auto-daemon", [ref] $created)
+
+    if (-not $created) {
+        Write-Host "approval-auto is already running in the background. Exiting." -ForegroundColor Yellow
+        exit 0
+    }
+
+    if ([string]::IsNullOrWhiteSpace($LogFile)) {
+        $LogFile = Join-Path $PSScriptRoot "approval-auto.log"
+    }
+
+    # Nothing reads the console once we detach, so keep a record on disk.
+    try {
+        Add-Content -Path $LogFile -Encoding UTF8 -Value (
+            "{0}  ---- started (pid {1}) ----" -f
+            (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $PID)
+    } catch { }
+
+    [Win32Windows]::HideConsole()
+}
 
 # ============================================================== helpers ======
 
@@ -496,6 +599,12 @@ function Get-Elements {
             $conds += New-Object System.Windows.Automation.PropertyCondition(
                 $AE::ControlTypeProperty, $t)
         }
+
+        # OrCondition needs at least two conditions; handing it one throws.
+        # Single-type lookups are common here, so use the condition directly.
+        if ($conds.Count -eq 0) { return @() }
+        if ($conds.Count -eq 1) { return @($Root.FindAll($Scope, $conds[0])) }
+
         $or = New-Object System.Windows.Automation.OrCondition($conds)
         return @($Root.FindAll($Scope, $or))
     } catch {
@@ -532,6 +641,28 @@ function Get-NormalizedName {
     return $n.Trim()
 }
 
+# The window menu bar contains File, Edit, View, Run, Terminal, Help. "Run" is
+# an exact match for an approve rule, so without this guard the tool opens the
+# Run menu on a loop. Approval dropdowns live under a Menu or Pane, never a
+# MenuBar, so excluding that whole subtree is safe.
+function Test-InMenuBar {
+    param($Element)
+
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $cur    = $Element
+
+    for ($i = 0; $i -lt 5 -and $cur; $i++) {
+        try {
+            if ($cur.Current.ControlType -eq $CT::MenuBar) { return $true }
+            if ($cur.Current.ControlType -eq $CT::TitleBar) { return $true }
+            $cur = $walker.GetParent($cur)
+        } catch {
+            break
+        }
+    }
+    return $false
+}
+
 function Test-Clickable {
     param($Element, [bool] $AllowOffscreen = $false)
 
@@ -541,7 +672,24 @@ function Test-Clickable {
     } catch {
         return $false
     }
+
+    if (Test-InMenuBar $Element) { return $false }
     return $true
+}
+
+# Cooldown key for a button. Keyed on label AND screen position, so approving
+# "Allow" in one session does not throttle the identical "Allow" in the next
+# one. The same button in the same place stays throttled as intended.
+function Get-ClickKey {
+    param($Element, [string] $Label)
+
+    try {
+        $r = $Element.Current.BoundingRectangle
+        if ($r.Width -gt 0 -and -not [double]::IsInfinity($r.X)) {
+            return ("{0}@{1},{2}" -f $Label, [int]$r.X, [int]$r.Y)
+        }
+    } catch { }
+    return $Label
 }
 
 # Returns the rule index for a label, or $null if it should not be clicked.
@@ -631,6 +779,21 @@ function Invoke-Element {
             [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref] $select)) {
         $select.Select()
         return "SelectionItemPattern"
+    }
+
+    # Fallback 2a: post the click to the window. The pointer never moves and
+    # the window is never activated, so it cannot interrupt what you are doing.
+    if ($NoCursor) {
+        try {
+            $r = $Element.Current.BoundingRectangle
+            if ($r.Width -gt 0 -and -not [double]::IsInfinity($r.X)) {
+                $x = [int]($r.X + $r.Width  / 2)
+                $y = [int]($r.Y + $r.Height / 2)
+                if ([Win32Windows]::PostClick($x, $y)) { return "PostClick" }
+            }
+        } catch {
+            Write-Verbose "PostClick failed: $_"
+        }
     }
 
     # Fallback 2: real mouse click at the point UIA nominates.
@@ -831,6 +994,481 @@ if ($List) {
     exit 0
 }
 
+# ================================================================== hud ======
+# A small always-on-top window: live count of what is waiting, plus one button
+# that clears every waiting terminal and chat. Solves the case where you are
+# reading one panel and a different session quietly blocks - you never have to
+# notice it, and you never have to go hunting through the sessions list.
+
+# The sessions list only exists in the tree while its view is on screen. If
+# nothing is found, reveal it, then rescan.
+function Show-SessionsList {
+    param($Roots)
+
+    # Ordered by how little they disturb what you are looking at. Opening the
+    # sidebar leaves the chat you are reading in place; "Go Back" would navigate
+    # the chat panel away, so it is the last resort.
+    #
+    # Matched against the RAW name, because "Go Back (Ctrl+N)" is the chat
+    # panel while "Go Back (Alt+LeftArrow)" is editor history. Normalizing both
+    # to "Go Back" would make them indistinguishable.
+    $reveal = @(
+        '^Show Agent Sessions Sidebar$'
+        '^Focus Agent Sessions$'
+        '^Chat Agent Sessions$'
+        '^Go Back \(Ctrl\+N\)$'
+    )
+
+    foreach ($p in $reveal) {
+        foreach ($r in $Roots) {
+            foreach ($e in (Get-Elements $r @($CT::Button))) {
+                $raw = Get-ElementName $e
+                if ($raw -notmatch $p) { continue }
+                if (-not (Test-Clickable $e $false)) { continue }
+                try {
+                    [void](Invoke-Element $e)
+                    Start-Sleep -Milliseconds 900
+                    return $true
+                } catch { }
+            }
+        }
+    }
+    return $false
+}
+
+# One approve button, highest priority, anywhere. Returns $null when there is none.
+function Find-ApproveButton {
+    param($Roots, [hashtable] $Skip = $null)
+
+    $best = $null; $bestRank = [int]::MaxValue; $bestName = ""; $bestKey = ""
+
+    foreach ($r in $Roots) {
+        foreach ($e in (Get-Elements $r $clickableTypes)) {
+            $name = Get-ElementName $e
+            $rank = Get-Rank $name
+            if ($null -eq $rank -or $rank -ge $bestRank) { continue }
+            if (-not (Test-Clickable $e $true)) { continue }
+
+            # A button that has been pressed repeatedly without anything
+            # changing is stuck. Ignoring it lets the sweep move on to the
+            # sessions instead of pressing it forever.
+            $key = Get-ClickKey $e (Get-NormalizedName $name)
+            if ($Skip -and $Skip.ContainsKey($key)) { continue }
+
+            $best = $e; $bestRank = $rank
+            $bestName = Get-NormalizedName $name
+            $bestKey  = $key
+        }
+    }
+    if (-not $best) { return $null }
+    return [pscustomobject]@{ Element = $best; Rank = $bestRank; Name = $bestName; Key = $bestKey }
+}
+
+# Open a sessions-list row so its approve buttons enter the tree.
+#
+# Rows expose only ScrollItemPattern, so a click is the only way in. With
+# -NoCursor the click is posted to the window: the pointer never moves and the
+# window is never activated. Posted input is not guaranteed to be handled, so
+# the caller checks whether it landed and calls again with -Force to escalate
+# to a real cursor click.
+function Open-SessionRow {
+    param($Element, [switch] $Force)
+
+    try { [void](Show-Element $Element) } catch { }
+
+    if ($NoCursor -and -not $Force) {
+        try {
+            $r = $Element.Current.BoundingRectangle
+            if ($r.Width -gt 0 -and -not [double]::IsInfinity($r.X)) {
+                $x = [int]($r.X + $r.Width  / 2)
+                $y = [int]($r.Y + $r.Height / 2)
+                if ([Win32Windows]::PostClick($x, $y)) { return "PostClick" }
+            }
+        } catch {
+            Write-Verbose "PostClick failed: $_"
+        }
+    }
+
+    return (Invoke-Element $Element)
+}
+
+# Every sessions-list row currently reporting a blocked status.
+function Find-WaitingRows {
+    param($Roots)
+
+    $rows = @()
+    foreach ($r in $Roots) {
+        foreach ($e in (Get-Elements $r $waitingTypes)) {
+            $name = Get-ElementName $e
+            if (-not (Test-Waiting $name (Get-ElementType $e))) { continue }
+            $target = Get-ClickableAncestor $e
+            if (-not (Test-Clickable $target $true)) { continue }
+            $rows += [pscustomobject]@{ Element = $target; Name = $name }
+        }
+    }
+    return $rows
+}
+
+# Approve everything, hopping between sessions until nothing is left.
+function Invoke-ApproveAll {
+    param([int] $MaxRounds = 60, [scriptblock] $Report = $null)
+
+    $approved = 0
+    $reveals  = 0
+    $skip     = @{}      # click keys that did not respond
+    $hits     = @{}      # click key -> times pressed in this sweep
+
+    for ($round = 0; $round -lt $MaxRounds; $round++) {
+
+        $handles = @(Get-TargetHandles)
+        if ($handles.Count -eq 0) { break }
+        $roots = @(Get-Roots $handles)
+
+        # 1. Anything approvable on screen right now.
+        $btn = Find-ApproveButton $roots $skip
+        if ($btn -and ($DryRun -or $FocusOnly)) {
+            if ($Report) { & $Report ("Would approve '{0}' (not clicked)" -f $btn.Name) }
+            break
+        }
+        if ($btn) {
+            $hits[$btn.Key] = 1 + $(if ($hits.ContainsKey($btn.Key)) { $hits[$btn.Key] } else { 0 })
+            if ($hits[$btn.Key] -gt 3) {
+                $skip[$btn.Key] = $true
+                if ($Report) { & $Report ("Ignoring stuck '{0}'" -f $btn.Name) }
+                continue
+            }
+            try {
+                $how = Invoke-Element $btn.Element
+                $approved++
+                if ($Report) { & $Report ("Approved '{0}' via {1}" -f $btn.Name, $how) }
+                Write-Log ("{0}  CLICKED '{1}' via {2}  (total: {3})" -f
+                    (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $btn.Name, $how, $approved)
+            } catch {
+                if ($Report) { & $Report ("Failed: " + $_.Exception.Message) }
+            }
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+
+        # 2. Nothing on screen, so open the next blocked session.
+        # The sessions list is only in the tree while its view is on screen.
+        # Sitting inside a chat replaces it, which is exactly when background
+        # sessions pile up unnoticed - so reveal it before concluding there is
+        # nothing to do. Two attempts: the sidebar, then a fallback control.
+        $rows = Find-WaitingRows $roots
+        if ($rows.Count -eq 0 -and $reveals -lt 2) {
+            $reveals++
+            if (Show-SessionsList $roots) {
+                if ($Report) { & $Report "Opened the sessions list" }
+                continue
+            }
+        }
+        if ($rows.Count -eq 0) { break }
+
+        try {
+            $how = Open-SessionRow $rows[0].Element
+            Start-Sleep -Milliseconds 900
+
+            # A posted click can be ignored. If nothing appeared, escalate once
+            # to a real cursor click rather than looping on a dead row.
+            if ($how -eq "PostClick") {
+                $check = @(Get-Roots @(Get-TargetHandles))
+                if (-not (Find-ApproveButton $check)) {
+                    $how = Open-SessionRow $rows[0].Element -Force
+                    Start-Sleep -Milliseconds 900
+                }
+            }
+
+            if ($Report) { & $Report ("Opened via {0}: {1}" -f $how, $rows[0].Name) }
+        } catch {
+            if ($Report) { & $Report ("Could not open session: " + $_.Exception.Message) }
+            break
+        }
+    }
+
+    return $approved
+}
+
+if ($Hud) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text            = "Approvals"
+    $form.FormBorderStyle = 'FixedToolWindow'
+    $form.TopMost         = $true
+    $form.ShowInTaskbar   = $false
+    $form.Size            = New-Object System.Drawing.Size(300, 152)
+    $form.BackColor       = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $form.ForeColor       = [System.Drawing.Color]::White
+
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $form.StartPosition = 'Manual'
+    $form.Location = New-Object System.Drawing.Point(
+        ($wa.Right - $form.Width - 24), ($wa.Bottom - $form.Height - 24))
+
+    $lblCount = New-Object System.Windows.Forms.Label
+    $lblCount.Location  = New-Object System.Drawing.Point(12, 10)
+    $lblCount.Size      = New-Object System.Drawing.Size(266, 24)
+    $lblCount.Font      = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $lblCount.Text      = "checking..."
+    $form.Controls.Add($lblCount)
+
+    $btnAll = New-Object System.Windows.Forms.Button
+    $btnAll.Location  = New-Object System.Drawing.Point(12, 40)
+    $btnAll.Size      = New-Object System.Drawing.Size(266, 36)
+    $btnAll.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $btnAll.FlatStyle = 'Flat'
+    $btnAll.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $btnAll.ForeColor = [System.Drawing.Color]::White
+    $btnAll.Text      = "Allow All"
+    $form.Controls.Add($btnAll)
+
+    $chkAuto = New-Object System.Windows.Forms.CheckBox
+    $chkAuto.Location = New-Object System.Drawing.Point(12, 82)
+    $chkAuto.Size     = New-Object System.Drawing.Size(266, 20)
+    $chkAuto.Text     = "Auto-approve as soon as anything waits"
+    $chkAuto.ForeColor = [System.Drawing.Color]::Gainsboro
+    $form.Controls.Add($chkAuto)
+
+    $lblLast = New-Object System.Windows.Forms.Label
+    $lblLast.Location  = New-Object System.Drawing.Point(12, 104)
+    $lblLast.Size      = New-Object System.Drawing.Size(266, 34)
+    $lblLast.ForeColor = [System.Drawing.Color]::Gray
+    $lblLast.Text      = ""
+    $form.Controls.Add($lblLast)
+
+    $script:busy = $false
+
+    $say = {
+        param([string] $Message)
+        $lblLast.Text = $Message
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $runAll = {
+        if ($script:busy) { return }
+        $script:busy  = $true
+        $btnAll.Enabled = $false
+        $btnAll.Text    = "Working..."
+        try {
+            $n = Invoke-ApproveAll -Report $say
+            & $say ("Approved {0} this run" -f $n)
+        } catch {
+            & $say ("Error: " + $_.Exception.Message)
+        } finally {
+            $btnAll.Enabled = $true
+            $btnAll.Text    = "Allow All"
+            $script:busy    = $false
+        }
+    }
+
+    $btnAll.Add_Click($runAll)
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 2000
+    # WinForms swallows errors raised inside a handler, so catch and surface them
+    # in the window instead of failing silently.
+    $timer.Add_Tick({
+        if ($script:busy) { return }
+
+        try {
+            $handles = @(Get-TargetHandles)
+            if ($handles.Count -eq 0) {
+                $lblCount.Text      = "VS Code not running"
+                $lblCount.ForeColor = [System.Drawing.Color]::Gray
+                return
+            }
+            $roots = @(Get-Roots $handles)
+
+            $btn   = Find-ApproveButton $roots
+            $rows  = @(Find-WaitingRows $roots)
+            $total = $rows.Count + $(if ($btn) { 1 } else { 0 })
+
+            if ($total -gt 0) {
+                $lblCount.Text      = "$total waiting"
+                $lblCount.ForeColor = [System.Drawing.Color]::FromArgb(255, 190, 80)
+                $btnAll.Text        = "Allow All ($total)"
+                if ($chkAuto.Checked) { & $runAll }
+            } else {
+                $lblCount.Text      = "Nothing waiting"
+                $lblCount.ForeColor = [System.Drawing.Color]::FromArgb(110, 200, 120)
+                $btnAll.Text        = "Allow All"
+            }
+        } catch {
+            $lblCount.Text      = "Scan error"
+            $lblCount.ForeColor = [System.Drawing.Color]::FromArgb(230, 110, 110)
+            $lblLast.Text       = $_.Exception.Message
+        }
+    })
+    $timer.Start()
+
+    Write-Host "HUD open. Close the window to exit." -ForegroundColor Cyan
+    [void]$form.ShowDialog()
+    $timer.Stop()
+    exit 0
+}
+
+# ================================================================ tray =======
+# Background mode: no console, no window, just a tray icon. It approves whatever
+# appears, whichever chat you are looking at. Right-click the icon to quit,
+# the same as any other app.
+
+if ($Background) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    # Build the three state icons once. Making them per-tick would leak handles.
+    function New-DotIcon {
+        param([System.Drawing.Color] $Colour)
+
+        $bmp = New-Object System.Drawing.Bitmap 16, 16
+        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = 'AntiAlias'
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $brush = New-Object System.Drawing.SolidBrush $Colour
+        $g.FillEllipse($brush, 1, 1, 14, 14)
+        $brush.Dispose()
+        $g.Dispose()
+
+        $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        $bmp.Dispose()
+        return $icon
+    }
+
+    $iconIdle    = New-DotIcon ([System.Drawing.Color]::FromArgb(110, 200, 120))  # green
+    $iconWaiting = New-DotIcon ([System.Drawing.Color]::FromArgb(255, 170, 40))   # amber
+    $iconBusy    = New-DotIcon ([System.Drawing.Color]::FromArgb(0, 150, 235))    # blue
+    $iconError   = New-DotIcon ([System.Drawing.Color]::FromArgb(230, 90, 90))    # red
+
+    $notify         = New-Object System.Windows.Forms.NotifyIcon
+    $notify.Icon    = $iconIdle
+    $notify.Text    = "approval-auto - starting"
+    $notify.Visible = $true
+
+    $script:busy      = $false
+    $script:autoOn    = $true
+    $script:total     = 0
+    $script:lastState = ""
+    $script:lastSweep = [DateTime]::MinValue
+
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+
+    $miStatus = $menu.Items.Add("Starting...")
+    $miStatus.Enabled = $false
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+    $miAll  = $menu.Items.Add("Allow All now")
+    $miAuto = $menu.Items.Add("Auto-approve")
+    $miAuto.CheckOnClick = $true
+    $miAuto.Checked      = $true
+
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $miLog  = $menu.Items.Add("Open log")
+    $miExit = $menu.Items.Add("Exit")
+
+    $notify.ContextMenuStrip = $menu
+
+    $ctx = New-Object System.Windows.Forms.ApplicationContext
+
+    $say = {
+        param([string] $Message)
+        $miStatus.Text = $Message
+        # NotifyIcon tooltips are capped at 63 characters by Windows.
+        $t = "approval-auto - $Message"
+        if ($t.Length -gt 63) { $t = $t.Substring(0, 60) + "..." }
+        $notify.Text = $t
+    }
+
+    $runAll = {
+        if ($script:busy) { return }
+        $script:busy   = $true
+        $notify.Icon   = $iconBusy
+        try {
+            $n = Invoke-ApproveAll -Report $say
+            $script:total += $n
+            if ($n -gt 0) { & $say ("approved {0} (total {1})" -f $n, $script:total) }
+        } catch {
+            $notify.Icon = $iconError
+            & $say ("error: " + $_.Exception.Message)
+        } finally {
+            $script:busy = $false
+        }
+    }
+
+    $miAll.Add_Click($runAll)
+    $miAuto.Add_Click({ $script:autoOn = $miAuto.Checked })
+
+    $miLog.Add_Click({
+        try {
+            if ($LogFile -and (Test-Path $LogFile)) { Start-Process notepad.exe $LogFile }
+            else { & $say "no log yet" }
+        } catch { }
+    })
+
+    $miExit.Add_Click({
+        $timer.Stop()
+        $notify.Visible = $false
+        $notify.Dispose()
+        $ctx.ExitThread()
+    })
+
+    # Double-click the icon to clear everything now.
+    $notify.Add_DoubleClick($runAll)
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = $IntervalMs
+    $timer.Add_Tick({
+        if ($script:busy) { return }
+
+        try {
+            $handles = @(Get-TargetHandles)
+            if ($handles.Count -eq 0) {
+                $notify.Icon = $iconIdle
+                & $say "VS Code not running"
+                return
+            }
+            $roots = @(Get-Roots $handles)
+
+            $btn   = Find-ApproveButton $roots
+            $rows  = @(Find-WaitingRows $roots)
+            $count = $rows.Count + $(if ($btn) { 1 } else { 0 })
+
+            if ($count -gt 0) {
+                $notify.Icon = $iconWaiting
+                & $say "$count waiting"
+                if ($script:autoOn) { & $runAll }
+            }
+            elseif ($script:autoOn -and
+                    ([DateTime]::UtcNow - $script:lastSweep).TotalMilliseconds -ge $SweepMs) {
+                # Looks idle, but the sessions list may simply not be on screen.
+                # Sweep anyway: this is the only thing that catches approvals
+                # piling up in chats you are not currently looking at.
+                $script:lastSweep = [DateTime]::UtcNow
+                & $runAll
+                if ($script:total -eq 0) {
+                    $notify.Icon = $iconIdle
+                    & $say "idle"
+                }
+            }
+            else {
+                $notify.Icon = $iconIdle
+                & $say ("idle - approved {0} so far" -f $script:total)
+            }
+        } catch {
+            $notify.Icon = $iconError
+            & $say ("scan error: " + $_.Exception.Message)
+        }
+    })
+    $timer.Start()
+
+    [System.Windows.Forms.Application]::Run($ctx)
+
+    $notify.Visible = $false
+    $notify.Dispose()
+    exit 0
+}
+
 # ============================================================== clicker ======
 
 $activeCount  = @($rules | Where-Object { $_.Tier -eq 'safe' -or $IncludeAmbiguous }).Count
@@ -843,9 +1481,10 @@ Write-Host ("Ambiguous: {0}   Offscreen: {1}   FocusSessions: {2}   DryRun: {3} 
 Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
 
 $clicks      = 0
-$lastClick   = @{}                       # label -> UTC time of last click
+$lastClick   = @{}                       # click key -> UTC time of last click
 $lastFocus   = @{}                       # waiting label -> UTC time of last focus
 $lastRescan  = [DateTime]::UtcNow
+$lastReveal  = [DateTime]::MinValue     # last time the sessions list was revealed
 
 while ($true) {
 
@@ -875,6 +1514,7 @@ while ($true) {
     $best     = $null
     $bestRank = [int]::MaxValue
     $bestName = ""
+    $bestKey  = ""
 
     foreach ($r in $roots) {
         foreach ($e in (Get-Elements $r $clickableTypes)) {
@@ -886,12 +1526,19 @@ while ($true) {
             $best     = $e
             $bestRank = $rank
             $bestName = Get-NormalizedName $name
+            $bestKey  = Get-ClickKey $e $bestName
         }
     }
 
+    # Tracks whether pass 1 actually pressed something this tick. If it only
+    # found a match it could not act on - cooldown, dry run, a sticky element
+    # that never goes away - we must still fall through to pass 2, or one
+    # phantom button starves the session sweep forever.
+    $didClick = $false
+
     if ($best) {
-        $since = if ($lastClick.ContainsKey($bestName)) {
-            ([DateTime]::UtcNow - $lastClick[$bestName]).TotalMilliseconds
+        $since = if ($lastClick.ContainsKey($bestKey)) {
+            ([DateTime]::UtcNow - $lastClick[$bestKey]).TotalMilliseconds
         } else { [double]::MaxValue }
 
         if ($DryRun -or $FocusOnly) {
@@ -903,7 +1550,8 @@ while ($true) {
             try {
                 if ($IncludeOffscreen) { [void](Show-Element $best) }
                 $how = Invoke-Element $best
-                $lastClick[$bestName] = [DateTime]::UtcNow
+                $lastClick[$bestKey] = [DateTime]::UtcNow
+                $didClick = $true
                 $clicks++
                 Write-Log ("{0}  CLICKED '{1}' via {2}  (total: {3})" -f
                     (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $bestName, $how, $clicks)
@@ -914,18 +1562,42 @@ while ($true) {
                 }
             } catch {
                 Write-Warning $_.Exception.Message
-                $lastClick[$bestName] = [DateTime]::UtcNow
+                $lastClick[$bestKey] = [DateTime]::UtcNow
             }
         }
 
-        Start-Sleep -Milliseconds $IntervalMs
-        continue
+        if ($didClick) {
+            Start-Sleep -Milliseconds $IntervalMs
+            continue
+        }
+        # Otherwise fall through: there is a match we cannot act on, and the
+        # background sessions still need sweeping.
     }
 
     # --- pass 2: no button on screen, so surface a waiting session ----------
-    # A background session's buttons are not in the tree at all. Clicking its
-    # "Needs attention" / "1 pending confirmation" marker focuses it, and the
-    # button shows up on the next scan.
+    # A background session's buttons are not in the tree at all. Opening its
+    # row in the sessions list makes them appear on the next scan.
+    #
+    # The sessions list itself only exists in the tree while its view is on
+    # screen. If it is hidden, nothing is ever found, so reveal it first -
+    # at most once a minute, since it is a visible change to the UI.
+    if (-not $NoFocusSessions -and -not $DryRun) {
+        $rowsAnywhere = 0
+        foreach ($r in $roots) { $rowsAnywhere += @(Find-WaitingRows @($r)).Count }
+
+        if ($rowsAnywhere -eq 0) {
+            $sinceReveal = ([DateTime]::UtcNow - $lastReveal).TotalMilliseconds
+            if ($sinceReveal -ge 60000) {
+                $lastReveal = [DateTime]::UtcNow
+                if (Show-SessionsList $roots) {
+                    Write-Host ("{0}  revealed the sessions list" -f
+                        (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+                    $roots = @(Get-Roots $handles)
+                }
+            }
+        }
+    }
+
     if (-not $NoFocusSessions) {
         foreach ($r in $roots) {
             $done = $false
@@ -951,8 +1623,7 @@ while ($true) {
                 }
 
                 try {
-                    [void](Show-Element $target)
-                    $how = Invoke-Element $target
+                    $how = Open-SessionRow $target
                     $lastFocus[$name] = [DateTime]::UtcNow
                     Write-Host ("{0}  FOCUSED '{1}' via {2}" -f
                         (Get-Date -Format "HH:mm:ss"), $name, $how) -ForegroundColor Magenta
